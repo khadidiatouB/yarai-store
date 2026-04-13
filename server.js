@@ -137,12 +137,12 @@ app.post("/api/stripe-webhook", express.raw({ type: "application/json" }), async
 // POST /api/paydunya/create — crée une facture et retourne l'URL de paiement
 app.post("/api/paydunya/create", async (req, res) => {
   try {
-    const { amount, channel, customer_name, customer_email, customer_phone, items } = req.body;
+    const { amount, channel, orderId, reference, customer_name, customer_email, customer_phone, items } = req.body;
 
     const response = await axios.post(`${PAYDUNYA_BASE}/checkout-invoice/create`, {
       invoice: {
         total_amount: Math.round(amount),
-        description:  "Commande YARAÏ",
+        description:  `Commande YARAÏ — ${reference || ""}`,
         items:        items || [],
       },
       store: {
@@ -157,17 +157,17 @@ app.post("/api/paydunya/create", async (req, res) => {
         return_url:   `${process.env.FRONTEND_URL || "http://localhost:5500"}/#/confirmation`,
         callback_url: `${process.env.BACKEND_URL  || "http://localhost:3000"}/api/paydunya/notify`,
       },
-      custom_data: {
-        customer_name,
-        customer_email,
-        customer_phone,
-        channel,
-      },
+      custom_data: { orderId, reference, customer_name, customer_email, customer_phone, channel },
     }, { headers: paydunyaHeaders });
 
     const data = response.data;
     if (data.response_code !== "00") {
       return res.status(400).json({ error: data.response_text || "Échec création facture PayDunya" });
+    }
+
+    // Stocker le token PayDunya sur la commande pour retrouver par paymentId
+    if (orderId) {
+      await prisma.order.update({ where: { id: orderId }, data: { paymentId: data.token } });
     }
 
     console.log("PayDunya invoice créée:", data.token);
@@ -291,8 +291,9 @@ async function confirmOrder(paymentId, method, metadata) {
       });
     }
 
-    // Envoyer email de confirmation
+    // Envoyer emails (client + admin)
     await sendConfirmationEmail(order);
+    await sendAdminNotification(order);
 
     console.log(`✅ Commande ${order.reference} confirmée — stock mis à jour`);
   } catch (err) {
@@ -348,9 +349,55 @@ async function sendConfirmationEmail(order) {
         </div>
       `,
     });
-    console.log(`📧 Email envoyé à ${order.customer.email}`);
+    console.log(`📧 Email confirmation envoyé à ${order.customer.email}`);
   } catch (err) {
-    console.error("Email error:", err.message);
+    console.error("Email client error:", err.message);
+  }
+}
+
+async function sendAdminNotification(order) {
+  if (!process.env.RESEND_API_KEY || !process.env.ADMIN_EMAIL) return;
+  try {
+    const { Resend } = require("resend");
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    const fmt = n => parseInt(n).toLocaleString("fr") + " FCFA";
+
+    const itemsText = order.items.map(i =>
+      `• ${i.product.name} — ${i.variant} / ${i.size} ×${i.qty} = ${fmt(i.price * i.qty)}`
+    ).join("\n");
+
+    await resend.emails.send({
+      from: `YARAÏ Notifications <commandes@${process.env.EMAIL_DOMAIN || "yarai.sn"}>`,
+      to:   process.env.ADMIN_EMAIL,
+      subject: `🛍️ Nouvelle commande ${order.reference} — ${fmt(order.total)}`,
+      html: `
+        <div style="font-family:'Outfit',sans-serif;max-width:600px;margin:0 auto;background:#FBF6EE;padding:40px">
+          <h1 style="font-size:22px;letter-spacing:6px;color:#C4704A;margin-bottom:4px">YARAÏ — Nouvelle commande</h1>
+          <h2 style="font-size:18px;font-weight:400;margin-bottom:20px">${order.reference} · ${fmt(order.total)}</h2>
+
+          <div style="background:white;border-radius:16px;padding:24px;margin-bottom:20px">
+            <p style="font-size:11px;letter-spacing:2px;color:#957860;text-transform:uppercase;margin-bottom:12px">Client</p>
+            <p><strong>${order.customer.name}</strong></p>
+            <p style="color:#957860">${order.customer.email}</p>
+            <p style="color:#957860">${order.customer.phone || "—"}</p>
+            <p style="color:#957860">${order.customer.address || ""} ${order.customer.city || ""} ${order.customer.country || ""}</p>
+          </div>
+
+          <div style="background:white;border-radius:16px;padding:24px;margin-bottom:20px">
+            <p style="font-size:11px;letter-spacing:2px;color:#957860;text-transform:uppercase;margin-bottom:12px">Articles</p>
+            <pre style="font-family:'Outfit',sans-serif;font-size:13px;color:#261A12;white-space:pre-wrap">${itemsText}</pre>
+          </div>
+
+          <div style="background:#C4704A;border-radius:16px;padding:20px;text-align:center">
+            <p style="color:white;font-size:13px;margin-bottom:12px">Gérer cette commande</p>
+            <a href="${process.env.FRONTEND_URL || ""}/admin.html" style="background:white;color:#C4704A;padding:10px 24px;border-radius:8px;text-decoration:none;font-size:12px;letter-spacing:2px;text-transform:uppercase">Ouvrir l'admin</a>
+          </div>
+        </div>
+      `,
+    });
+    console.log(`📧 Notification admin envoyée à ${process.env.ADMIN_EMAIL}`);
+  } catch (err) {
+    console.error("Email admin error:", err.message);
   }
 }
 

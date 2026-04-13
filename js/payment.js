@@ -29,23 +29,48 @@ async function processPayDunya(amount, name, email, phone, channel) {
   if (payBtn) { payBtn.disabled = true; payBtn.textContent = "Redirection vers le paiement…"; }
 
   try {
-    const coName  = document.getElementById("co-name")?.value.trim()   || name;
-    const coEmail = document.getElementById("co-email")?.value.trim()  || email;
-    const coPhone = document.getElementById("co-phone")?.value.trim()  || phone;
+    const coName    = document.getElementById("co-name")?.value.trim()    || name;
+    const coEmail   = document.getElementById("co-email")?.value.trim()   || email;
+    const coPhone   = document.getElementById("co-phone")?.value.trim()   || phone;
+    const coCity    = document.getElementById("co-city")?.value.trim()    || "";
+    const coAddress = document.getElementById("co-address")?.value.trim() || "";
+    const coCountry = document.getElementById("co-country")?.value        || "SN";
 
+    // 1. Créer la commande en base AVANT le paiement
+    const orderRes = await fetch(PAYMENT_CONFIG.backendUrl + "/api/orders", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        customer: { name: coName, email: coEmail, phone: coPhone, city: coCity, address: coAddress, country: coCountry },
+        paymentMethod: channel === "WAVE_SN" ? "wave" : "orange",
+        items: cart.map(c => ({
+          productId: c.product.id,
+          variant:   c.variant.label,
+          size:      c.size,
+          qty:       c.qty,
+          price:     c.product.price,
+        })),
+      }),
+    });
+    if (!orderRes.ok) throw new Error("Erreur création commande");
+    const { orderId, reference } = await orderRes.json();
+
+    // 2. Créer la facture PayDunya
     const res = await fetch(PAYMENT_CONFIG.backendUrl + "/api/paydunya/create", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         amount,
         channel,
+        orderId,
+        reference,
         customer_name:  coName,
         customer_email: coEmail,
         customer_phone: coPhone,
         items: cart.map(c => ({
-          name:    c.product.name + " – " + c.variant.label + " / " + c.size,
-          qty:     c.qty,
-          unit_price: c.product.price,
+          name:        c.product.name + " – " + c.variant.label + " / " + c.size,
+          qty:         c.qty,
+          unit_price:  c.product.price,
           total_price: c.product.price * c.qty,
         })),
       }),
@@ -53,17 +78,9 @@ async function processPayDunya(amount, name, email, phone, channel) {
 
     if (!res.ok) throw new Error("Erreur serveur: " + res.status);
     const data = await res.json();
-
     if (!data.checkout_url) throw new Error("URL de paiement manquante");
 
-    // Sauvegarder le token pour vérification au retour
-    localStorage.setItem("yarai_pending_tx", JSON.stringify({
-      token: data.token,
-      amount,
-      cart: JSON.stringify(cart),
-    }));
-
-    // Rediriger vers la page de paiement PayDunya
+    localStorage.setItem("yarai_pending_tx", JSON.stringify({ token: data.token, orderId, amount }));
     window.location.href = data.checkout_url;
 
   } catch (err) {
