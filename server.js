@@ -316,7 +316,7 @@ async function sendConfirmationEmail(order) {
       </tr>`).join("");
 
     await resend.emails.send({
-      from: `YARAÏ <commandes@${process.env.EMAIL_DOMAIN || "yarai.sn"}>`,
+      from: "YARAÏ <onboarding@resend.dev>",
       to:   order.customer.email,
       subject: `✅ Commande confirmée — ${order.reference}`,
       html: `
