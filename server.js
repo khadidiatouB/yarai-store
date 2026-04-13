@@ -5,6 +5,8 @@
 
 const express            = require("express");
 const axios              = require("axios");
+const jwt                = require("jsonwebtoken");
+const bcrypt             = require("bcryptjs");
 const { Pool }           = require("pg");
 const { PrismaPg }       = require("@prisma/adapter-pg");
 const { PrismaClient }   = require("@prisma/client");
@@ -270,31 +272,27 @@ app.get("/api/orders", async (req, res) => {
 ══════════════════════════════════════════════════════════════ */
 async function confirmOrder(paymentId, method, metadata) {
   try {
-    // Trouver la commande par paymentId ou référence dans les métadonnées
     const order = await prisma.order.findFirst({
       where: { OR: [{ paymentId }, { reference: metadata?.reference }] },
-      include: { items: true },
+      include: { items: { include: { product: true } }, customer: true },
     });
 
     if (!order || order.status === "PAID") return;
 
-    // Marquer comme payée
     await prisma.order.update({
       where: { id: order.id },
       data:  { status: "PAID", paymentId },
     });
 
-    // Décrémenter le stock pour chaque article
     for (const item of order.items) {
       await prisma.stock.updateMany({
-        where: {
-          productId: item.productId,
-          variant:   item.variant,
-          size:      item.size,
-        },
-        data: { qty: { decrement: item.qty } },
+        where: { productId: item.productId, variant: item.variant, size: item.size },
+        data:  { qty: { decrement: item.qty } },
       });
     }
+
+    // Envoyer email de confirmation
+    await sendConfirmationEmail(order);
 
     console.log(`✅ Commande ${order.reference} confirmée — stock mis à jour`);
   } catch (err) {
@@ -302,10 +300,187 @@ async function confirmOrder(paymentId, method, metadata) {
   }
 }
 
+async function sendConfirmationEmail(order) {
+  if (!process.env.RESEND_API_KEY) return;
+  try {
+    const { Resend } = require("resend");
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    const fmt = n => parseInt(n).toLocaleString("fr") + " FCFA";
+
+    const itemsHtml = order.items.map(i => `
+      <tr>
+        <td style="padding:10px 0;border-bottom:1px solid #F2E4D0">${i.product.name} — ${i.variant} / ${i.size}</td>
+        <td style="padding:10px 0;border-bottom:1px solid #F2E4D0;text-align:right">×${i.qty}</td>
+        <td style="padding:10px 0;border-bottom:1px solid #F2E4D0;text-align:right">${fmt(i.price * i.qty)}</td>
+      </tr>`).join("");
+
+    await resend.emails.send({
+      from: `YARAÏ <commandes@${process.env.EMAIL_DOMAIN || "yarai.sn"}>`,
+      to:   order.customer.email,
+      subject: `✅ Commande confirmée — ${order.reference}`,
+      html: `
+        <div style="font-family:'Outfit',sans-serif;max-width:600px;margin:0 auto;background:#FBF6EE;padding:40px">
+          <h1 style="font-size:28px;letter-spacing:8px;color:#C4704A;margin-bottom:4px">YARAÏ</h1>
+          <p style="font-size:11px;letter-spacing:2px;color:#957860;text-transform:uppercase;margin-bottom:32px">simplement belle</p>
+
+          <h2 style="font-size:20px;font-weight:400;margin-bottom:8px">Merci pour votre commande, ${order.customer.name.split(" ")[0]} !</h2>
+          <p style="color:#957860;margin-bottom:24px">Votre paiement a bien été reçu. Référence : <strong>${order.reference}</strong></p>
+
+          <div style="background:white;border-radius:16px;padding:24px;margin-bottom:24px">
+            <table style="width:100%;border-collapse:collapse">
+              <tr>
+                <th style="text-align:left;font-size:10px;letter-spacing:2px;color:#957860;text-transform:uppercase;padding-bottom:12px">Article</th>
+                <th style="text-align:right;font-size:10px;letter-spacing:2px;color:#957860;text-transform:uppercase;padding-bottom:12px">Qté</th>
+                <th style="text-align:right;font-size:10px;letter-spacing:2px;color:#957860;text-transform:uppercase;padding-bottom:12px">Prix</th>
+              </tr>
+              ${itemsHtml}
+              <tr>
+                <td colspan="2" style="padding-top:16px;font-weight:500">Total</td>
+                <td style="padding-top:16px;text-align:right;color:#C4704A;font-weight:500">${fmt(order.total)}</td>
+              </tr>
+            </table>
+          </div>
+
+          <p style="font-size:13px;color:#957860;line-height:1.8">
+            Notre équipe vous contactera dans les 24h pour organiser la livraison.<br>
+            Des questions ? Écrivez-nous à <a href="mailto:contact@yarai.sn" style="color:#C4704A">contact@yarai.sn</a>
+          </p>
+        </div>
+      `,
+    });
+    console.log(`📧 Email envoyé à ${order.customer.email}`);
+  } catch (err) {
+    console.error("Email error:", err.message);
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   AUTHENTIFICATION ADMIN (JWT)
+══════════════════════════════════════════════════════════════ */
+
+const JWT_SECRET = process.env.JWT_SECRET || "yarai_dev_secret_change_in_prod";
+
+// Middleware : vérifie le token JWT
+function authAdmin(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith("Bearer ")) return res.status(401).json({ error: "Non autorisé" });
+  try {
+    req.admin = jwt.verify(auth.slice(7), JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: "Token invalide ou expiré" });
+  }
+}
+
+// POST /api/admin/login
+app.post("/api/admin/login", async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ error: "Email et mot de passe requis" });
+  try {
+    const admin = await prisma.admin.findUnique({ where: { email } });
+    if (!admin || !(await bcrypt.compare(password, admin.password))) {
+      return res.status(401).json({ error: "Identifiants incorrects" });
+    }
+    const token = jwt.sign({ id: admin.id, email: admin.email }, JWT_SECRET, { expiresIn: "8h" });
+    res.json({ token });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/admin/setup — créer le premier compte admin (désactivé après usage)
+app.post("/api/admin/setup", async (req, res) => {
+  const { email, password, secret } = req.body;
+  if (secret !== process.env.SETUP_SECRET) return res.status(403).json({ error: "Secret incorrect" });
+  try {
+    const existing = await prisma.admin.count();
+    if (existing > 0) return res.status(400).json({ error: "Admin déjà créé" });
+    const hash = await bcrypt.hash(password, 12);
+    const admin = await prisma.admin.create({ data: { email, password: hash } });
+    res.json({ ok: true, email: admin.email });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ══════════════════════════════════════════════════════════════
+   ROUTES ADMIN PROTÉGÉES
+══════════════════════════════════════════════════════════════ */
+
+// GET /api/admin/orders — toutes les commandes
+app.get("/api/admin/orders", authAdmin, async (_req, res) => {
+  try {
+    const orders = await prisma.order.findMany({
+      include: { customer: true, items: { include: { product: true } } },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json(orders);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/admin/orders/:id — mettre à jour le statut d'une commande
+app.patch("/api/admin/orders/:id", authAdmin, async (req, res) => {
+  const { status } = req.body;
+  try {
+    const order = await prisma.order.update({
+      where: { id: parseInt(req.params.id) },
+      data:  { status },
+    });
+    res.json(order);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/stock — tout le stock
+app.get("/api/admin/stock", authAdmin, async (_req, res) => {
+  try {
+    const stocks = await prisma.stock.findMany({ include: { product: true }, orderBy: { productId: "asc" } });
+    res.json(stocks);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/admin/stock/:id — modifier une quantité
+app.patch("/api/admin/stock/:id", authAdmin, async (req, res) => {
+  const { qty } = req.body;
+  try {
+    const stock = await prisma.stock.update({
+      where: { id: parseInt(req.params.id) },
+      data:  { qty: parseInt(qty) },
+    });
+    res.json(stock);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/admin/dashboard — stats rapides
+app.get("/api/admin/dashboard", authAdmin, async (_req, res) => {
+  try {
+    const [totalOrders, paidOrders, totalRevenue, lowStock] = await Promise.all([
+      prisma.order.count(),
+      prisma.order.count({ where: { status: "PAID" } }),
+      prisma.order.aggregate({ where: { status: "PAID" }, _sum: { total: true } }),
+      prisma.stock.findMany({ where: { qty: { lte: 2 } }, include: { product: true } }),
+    ]);
+    res.json({
+      totalOrders,
+      paidOrders,
+      revenue: totalRevenue._sum.total || 0,
+      lowStock,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /* ══════════════════════════════════════════════════════════════
    HEALTH CHECK
 ══════════════════════════════════════════════════════════════ */
-// Toutes les routes non-API renvoient index.html (SPA)
 app.get("/health", (_req, res) => res.json({ status: "YARAÏ server OK" }));
 
 const PORT = process.env.PORT || 3000;

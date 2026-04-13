@@ -72,6 +72,14 @@ enum OrderStatus {
   CANCELLED  // annulé
 }
 
+// ── Admin ─────────────────────────────────────────────────────
+model Admin {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  password  String   // bcrypt hash
+  createdAt DateTime @default(now())
+}
+
 // ── Ligne de commande ─────────────────────────────────────────
 model OrderItem {
   id        Int     @id @default(autoincrement())
